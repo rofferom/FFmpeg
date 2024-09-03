@@ -260,6 +260,7 @@ External library support:
                            for DNN based filters like dnn_processing [no]
   --enable-libopus         enable Opus de/encoding via libopus [no]
   --enable-libplacebo      enable libplacebo library [no]
+  --enable-lcevc_encoder   enable lcevc encoder [no]
   --enable-libpulse        enable Pulseaudio input via libpulse [no]
   --enable-libqrencode     enable QR encode generation via libqrencode [no]
   --enable-libquirc        enable QR decoding via libquirc [no]
@@ -1946,6 +1947,7 @@ EXTERNAL_LIBRARY_LIST="
     libopenvino
     libopus
     libplacebo
+    lcevc_encoder
     libpulse
     libqrencode
     libquirc
@@ -3008,6 +3010,7 @@ ipu_decoder_select="mpegvideodec"
 jpegls_decoder_select="mjpeg_decoder"
 jv_decoder_select="blockdsp"
 lagarith_decoder_select="llviddsp"
+lcevc_encoder_select="vulkan"
 lead_decoder_select="blockdsp idctdsp jpegtables"
 ljpeg_encoder_select="jpegtables"
 lscr_decoder_select="inflate_wrapper"
@@ -7391,6 +7394,9 @@ enabled vdpau &&
 
 enabled vdpau &&
     check_lib vdpau_x11 "vdpau/vdpau.h vdpau/vdpau_x11.h" vdp_device_create_x11 -lvdpau -lX11
+
+enabled lcevc_encoder &&
+    check_lib lcevc_encoder "lcevc_eil.h" EIL_Initialise -llcevc_eil -llcevc_eilp_nvenc_h264
 
 if enabled_all vulkan vulkan_static; then
     check_pkg_config vulkan "vulkan >= 1.3.277" "vulkan/vulkan.h" "defined VK_VERSION_1_3" ||
