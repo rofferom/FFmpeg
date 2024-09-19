@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define USE_VULKAN 0
+#define USE_VULKAN 1
 
 #include "avcodec.h"
 #include "encode.h"
