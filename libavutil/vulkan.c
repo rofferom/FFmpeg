@@ -979,8 +979,7 @@ int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size,
     vk->GetBufferMemoryRequirements2(s->hwctx->act_dev, &req_desc, &req);
 
     /* In case the implementation prefers/requires dedicated allocation */
-    use_ded_mem = ded_req.prefersDedicatedAllocation |
-                  ded_req.requiresDedicatedAllocation;
+    use_ded_mem = 0;
     if (use_ded_mem) {
         ded_alloc.buffer = buf->buf;
         ded_alloc.pNext = alloc_pNext;
