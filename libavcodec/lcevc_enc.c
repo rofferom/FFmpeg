@@ -34,6 +34,7 @@
 typedef struct LCEVCENCCtx {
     AVClass *class;
     EILContext lc;
+    AVBufferPool *tmp_pool;
 
 #if USE_VULKAN
     FFVulkanContext s;
@@ -147,7 +148,7 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         .properties_json = USE_VULKAN ?
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
                            NULL,
-        .external_input = !USE_VULKAN,
+        .external_input = 1,
     };
 
     ret = EIL_Initialise(ctx->lc, &lc_init_info);
@@ -184,106 +185,6 @@ static inline void get_plane_wh(uint32_t *w, uint32_t *h, enum AVPixelFormat for
     *w = AV_CEIL_RSHIFT(frame_w, desc->log2_chroma_w);
     *h = AV_CEIL_RSHIFT(frame_h, desc->log2_chroma_h);
 }
-
-static int create_mapped_buffer(LCEVCENCCtx *ctx,
-                                FFVkBuffer *vkb, VkBufferUsageFlags usage,
-                                size_t size,
-                                VkExternalMemoryBufferCreateInfo *create_desc,
-                                VkImportMemoryFdInfoKHR *import_desc,
-                                VkMemoryFdPropertiesKHR *props)
-{
-    int err;
-    VkResult ret;
-    FFVulkanContext *s = &ctx->s;
-    FFVulkanFunctions *vk = &ctx->s.vkfn;
-
-    VkBufferCreateInfo buf_spawn = {
-        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .pNext       = create_desc,
-        .usage       = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .size        = size,
-    };
-    VkMemoryRequirements req = {
-        .size           = size,
-        .alignment      = 0,
-        .memoryTypeBits = props->memoryTypeBits,
-    };
-
-    err = ff_vk_alloc_mem(s, &req,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                          import_desc, &vkb->flags, &vkb->mem);
-    if (err < 0)
-        return err;
-
-    ret = vk->CreateBuffer(s->hwctx->act_dev, &buf_spawn, s->hwctx->alloc, &vkb->buf);
-    if (ret != VK_SUCCESS) {
-        vk->FreeMemory(s->hwctx->act_dev, vkb->mem, s->hwctx->alloc);
-        return AVERROR_EXTERNAL;
-    }
-
-    ret = vk->BindBufferMemory(s->hwctx->act_dev, vkb->buf, vkb->mem, 0);
-    if (ret != VK_SUCCESS) {
-        vk->FreeMemory(s->hwctx->act_dev, vkb->mem, s->hwctx->alloc);
-        vk->DestroyBuffer(s->hwctx->act_dev, vkb->buf, s->hwctx->alloc);
-        return AVERROR_EXTERNAL;
-    }
-
-    return 0;
-}
-
-static int import_buffer(LCEVCENCCtx *ctx,
-                         FFVkBuffer *out, EILVulkanMemoryInfo **in, int bufs)
-{
-    int i, err;
-    FFVulkanContext *s = &ctx->s;
-    FFVulkanFunctions *vk = &ctx->s.vkfn;
-
-    for (i = 0; i < bufs; i++) {
-        FFVkBuffer *vkb = &out[i];
-        EILVulkanMemoryInfo *lb = in[i];
-        VkExternalMemoryBufferCreateInfo create_desc = {
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-        };
-        VkImportMemoryFdInfoKHR import_desc = {
-            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-            .fd = lb->handle,
-        };
-        VkMemoryFdPropertiesKHR props = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-        };
-
-        vk->GetMemoryFdPropertiesKHR(s->hwctx->act_dev,
-                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-                                     lb->handle,
-                                     &props);
-
-        /* Create a buffer */
-        vkb = av_mallocz(sizeof(*vkb));
-        if (!vkb) {
-            err = AVERROR(ENOMEM);
-            goto fail;
-        }
-
-        err = create_mapped_buffer(ctx, vkb,
-                                   lb->buffer_usage_flags,
-                                   lb->total_size,
-                                   &create_desc, &import_desc,
-                                   &props);
-        if (err < 0) {
-            av_free(vkb);
-            goto fail;
-        }
-    }
-
-    return 0;
-fail:
-    for (i = i - 1; i >= 0; i--)
-        ff_vk_free_buf(s, &out[i]);
-    return err;
-}
 #endif
 
 static int lcevc_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
@@ -299,7 +200,6 @@ static int lcevc_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 #if USE_VULKAN
     FFVulkanFunctions *vk = &ctx->s.vkfn;
     FFVkExecContext *exec;
-    FFVkBuffer imp_buf[3];
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(ctx->s.frames->sw_format);
 
     AVVkFrame *vkf;
@@ -312,9 +212,8 @@ static int lcevc_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
                                                        VK_IMAGE_ASPECT_PLANE_0_BIT,
                                                        VK_IMAGE_ASPECT_PLANE_1_BIT,
                                                        VK_IMAGE_ASPECT_PLANE_2_BIT, };
-#else
-    EILPicture lp_tmp;
 #endif
+    EILPicture lp_tmp;
 
     EILPicture *lp = NULL;
 
@@ -338,12 +237,60 @@ start:
 #if USE_VULKAN
     vkf = (AVVkFrame *)frame->data[0];
     nb_images = ff_vk_count_images(vkf);
+    EILVulkanMemoryInfo vkmems[3] = { 0 };
 
-    ret = EIL_GetPicture(ctx->lc, EIL_FrameType_Progressive, &lp);
-    if (ret != EIL_RC_Success) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to allocate picture: %i\n", ret);
-        av_frame_free(&frame);
+    lp_tmp = (EILPicture) {
+        .memory_type = EIL_MT_VulkanBuffer,
+        .num_planes = av_pix_fmt_count_planes(avctx->sw_pix_fmt),
+        .plane = { &vkmems[0],
+                   &vkmems[1],
+                   &vkmems[2], },
+        .stride = { FFALIGN(frame->width, 64),
+                    FFALIGN(frame->width/2, 64),
+                    FFALIGN(frame->width/2, 64), },
+    };
+    lp = &lp_tmp;
+
+    VkExportMemoryAllocateInfo exp_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
+    };
+
+    FFVkBuffer tmp_buf;
+    err = ff_vk_create_buf(&ctx->s, &tmp_buf,
+                           frame->width*frame->height*3,
+                           NULL, &exp_info,
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (err < 0)
+        return err;
+
+    VkMemoryGetFdInfoKHR buf_handle_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+        .memory = tmp_buf.mem,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+    };
+    int buf_handle = -1;
+    VkResult vret = vk->GetMemoryFdKHR(ctx->s.hwctx->act_dev,
+                                       &buf_handle_info,
+                                       &buf_handle);
+    if (vret != VK_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR, "Unable to export FD handle!\n");
         return AVERROR_EXTERNAL;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < 3; i++) {
+        vkmems[i] = (EILVulkanMemoryInfo) {
+            .handle = buf_handle,
+            .size = lp->stride[i]*(frame->height >> (i > 0)),
+            .offset = off,
+            .total_size = tmp_buf.size,
+            .memory_property_flags = tmp_buf.flags,
+            .buffer_usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        };
+        off += vkmems[i].size;
     }
 
     exec = ff_vk_exec_get(&ctx->exec_pool);
@@ -372,13 +319,6 @@ start:
             .imageMemoryBarrierCount = nb_img_bar,
     });
 
-    err = import_buffer(ctx, imp_buf, (EILVulkanMemoryInfo **)lp->plane, lp->num_planes);
-    if (err < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to import Vulkan buffer\n");
-        av_frame_free(&frame);
-        return err;
-    }
-
     for (int i = 0; i < lp->num_planes; i++) {
         int img_idx = FFMIN(i, (nb_images - 1));
         EILVulkanMemoryInfo *pb = lp->plane[i];
@@ -406,7 +346,7 @@ start:
 
         vk->CmdCopyImageToBuffer(exec->buf, vkf->img[img_idx],
                                  img_bar[img_idx].newLayout,
-                                 imp_buf[i].buf,
+                                 tmp_buf.buf,
                                  1, &region[i]);
     };
 
@@ -416,9 +356,7 @@ start:
         av_frame_free(&frame);
     }
     ff_vk_exec_wait(&ctx->s, exec);
-
-    for (int i = 0; i < lp->num_planes; i++)
-        ff_vk_free_buf(&ctx->s, &imp_buf[i]);
+    ff_vk_free_buf(&ctx->s, &tmp_buf);
 #else
     lp_tmp = (EILPicture) {
         .memory_type = EIL_MT_Host,
