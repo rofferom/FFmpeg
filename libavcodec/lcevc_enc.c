@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define USE_VULKAN 0
+#define USE_VULKAN 1
 
 #include "avcodec.h"
 #include "encode.h"
@@ -144,7 +144,9 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         .fps_denom = avctx->framerate.den,
         .bitrate = avctx->bit_rate / 1000,
         .gop_length = avctx->gop_size,
-        .properties_json = NULL,
+        .properties_json = USE_VULKAN ?
+                           "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
+                           NULL,
         .external_input = !USE_VULKAN,
     };
 
