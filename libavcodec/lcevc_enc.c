@@ -146,7 +146,11 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         .bitrate = avctx->bit_rate / 1000,
         .gop_length = avctx->gop_size,
         .properties_json = USE_VULKAN ?
+#if 1
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
+#else
+                           "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\", \"log_groups\": \"gpu\"}" :
+#endif
                            NULL,
         .external_input = 1,
     };
@@ -256,39 +260,44 @@ start:
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
     };
 
-    FFVkBuffer tmp_buf;
-    err = ff_vk_create_buf(&ctx->s, &tmp_buf,
-                           frame->width*frame->height*3,
-                           NULL, &exp_info,
-                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    if (err < 0)
-        return err;
+    FFVkBuffer tmp_buf[3];
+    for (int i = 0; i < 3; i++) {
+        err = ff_vk_create_buf(&ctx->s, &tmp_buf[i],
+                               frame->width*frame->height*16,
+                               NULL, &exp_info,
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (err < 0)
+            return err;
+    }
 
-    VkMemoryGetFdInfoKHR buf_handle_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-        .memory = tmp_buf.mem,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-    };
-    int buf_handle = -1;
-    VkResult vret = vk->GetMemoryFdKHR(ctx->s.hwctx->act_dev,
-                                       &buf_handle_info,
-                                       &buf_handle);
-    if (vret != VK_SUCCESS) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to export FD handle!\n");
-        return AVERROR_EXTERNAL;
+    int buf_handle[3] = { -1, -1, -1 };
+    for (int i = 0; i < 3; i++) {
+        VkMemoryGetFdInfoKHR buf_handle_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+            .memory = tmp_buf[i].mem,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        };
+        VkResult vret = vk->GetMemoryFdKHR(ctx->s.hwctx->act_dev,
+                                           &buf_handle_info,
+                                           &buf_handle[i]);
+        if (vret != VK_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR, "Unable to export FD handle!\n");
+            return AVERROR_EXTERNAL;
+        }
     }
 
     size_t off = 0;
     for (int i = 0; i < 3; i++) {
         vkmems[i] = (EILVulkanMemoryInfo) {
-            .handle = buf_handle,
-            .size = lp->stride[i]*(frame->height >> (i > 0)),
-            .offset = off,
-            .total_size = tmp_buf.size,
-            .memory_property_flags = tmp_buf.flags,
-            .buffer_usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .handle = buf_handle[i],
+            .size = tmp_buf[i].size,
+            .offset = 0,
+            .total_size = tmp_buf[i].size,
+            .memory_property_flags = tmp_buf[i].flags,
+            .buffer_usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         };
         off += vkmems[i].size;
     }
@@ -346,7 +355,7 @@ start:
 
         vk->CmdCopyImageToBuffer(exec->buf, vkf->img[img_idx],
                                  img_bar[img_idx].newLayout,
-                                 tmp_buf.buf,
+                                 tmp_buf[i].buf,
                                  1, &region[i]);
     };
 
@@ -356,7 +365,9 @@ start:
         av_frame_free(&frame);
     }
     ff_vk_exec_wait(&ctx->s, exec);
-    ff_vk_free_buf(&ctx->s, &tmp_buf);
+
+    for (int i = 0; i < 3; i++)
+        ff_vk_free_buf(&ctx->s, &tmp_buf[i]);
 #else
     lp_tmp = (EILPicture) {
         .memory_type = EIL_MT_Host,
