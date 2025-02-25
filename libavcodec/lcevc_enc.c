@@ -260,8 +260,8 @@ start:
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
     };
 
-    FFVkBuffer tmp_buf[3];
-    for (int i = 0; i < 3; i++) {
+    FFVkBuffer tmp_buf[AV_NUM_DATA_POINTERS];
+    for (int i = 0; i < lp->num_planes; i++) {
         err = ff_vk_create_buf(&ctx->s, &tmp_buf[i],
                                frame->width*frame->height*16,
                                NULL, &exp_info,
@@ -272,13 +272,14 @@ start:
             return err;
     }
 
-    int buf_handle[3] = { -1, -1, -1 };
-    for (int i = 0; i < 3; i++) {
+    int buf_handle[AV_NUM_DATA_POINTERS];
+    for (int i = 0; i < lp->num_planes; i++) {
         VkMemoryGetFdInfoKHR buf_handle_info = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
             .memory = tmp_buf[i].mem,
             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
         };
+        buf_handle[i] = -1;
         VkResult vret = vk->GetMemoryFdKHR(ctx->s.hwctx->act_dev,
                                            &buf_handle_info,
                                            &buf_handle[i]);
@@ -289,7 +290,7 @@ start:
     }
 
     size_t off = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < lp->num_planes; i++) {
         vkmems[i] = (EILVulkanMemoryInfo) {
             .handle = buf_handle[i],
             .size = tmp_buf[i].size,
@@ -366,7 +367,7 @@ start:
     }
     ff_vk_exec_wait(&ctx->s, exec);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < lp->num_planes; i++)
         ff_vk_free_buf(&ctx->s, &tmp_buf[i]);
 #else
     lp_tmp = (EILPicture) {
