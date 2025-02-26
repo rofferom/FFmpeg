@@ -25,7 +25,8 @@
 
 #if USE_VULKAN
 #include "hwconfig.h"
-#include "vulkan.h"
+#include "vulkan_encode.h"
+#include "libavutil/vulkan.h"
 #include "libavutil/mem.h"
 #endif
 
@@ -38,7 +39,7 @@ typedef struct LCEVCENCCtx {
 
 #if USE_VULKAN
     FFVulkanContext s;
-    FFVkQueueFamilyCtx qf;
+    AVVulkanDeviceQueueFamily *qf;
     FFVkExecPool exec_pool;
 #endif
 } LCEVCENCCtx;
@@ -107,13 +108,13 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         return err;
     }
 
-    err = ff_vk_qf_init(&ctx->s, &ctx->qf, VK_QUEUE_COMPUTE_BIT);
-    if (err < 0) {
+    ctx->qf = ff_vk_qf_find(&ctx->s, VK_QUEUE_COMPUTE_BIT, 0);
+    if (!ctx->qf) {
         lcevc_encode_close(avctx);
         return err;
     }
 
-    err = ff_vk_exec_pool_init(&ctx->s, &ctx->qf, &ctx->exec_pool, 1,
+    err = ff_vk_exec_pool_init(&ctx->s, ctx->qf, &ctx->exec_pool, 1,
                                0, 0, 0, NULL);
     if (err < 0) {
         lcevc_encode_close(avctx);
@@ -146,7 +147,7 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         .bitrate = avctx->bit_rate / 1000,
         .gop_length = avctx->gop_size,
         .properties_json = USE_VULKAN ?
-#if 1
+#if 0
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
 #else
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\", \"log_groups\": \"gpu\"}" :
@@ -260,10 +261,10 @@ start:
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
     };
 
-    FFVkBuffer tmp_buf[AV_NUM_DATA_POINTERS];
+    FFVkBuffer tmp_buf[4] = { NULL };
     for (int i = 0; i < lp->num_planes; i++) {
         err = ff_vk_create_buf(&ctx->s, &tmp_buf[i],
-                               frame->width*frame->height*16,
+                               lp_tmp.stride[i]*frame->height,
                                NULL, &exp_info,
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -272,14 +273,13 @@ start:
             return err;
     }
 
-    int buf_handle[AV_NUM_DATA_POINTERS];
+    int buf_handle[4] = { -1, -1, -1, -1 };
     for (int i = 0; i < lp->num_planes; i++) {
         VkMemoryGetFdInfoKHR buf_handle_info = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
             .memory = tmp_buf[i].mem,
             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
         };
-        buf_handle[i] = -1;
         VkResult vret = vk->GetMemoryFdKHR(ctx->s.hwctx->act_dev,
                                            &buf_handle_info,
                                            &buf_handle[i]);
@@ -303,7 +303,7 @@ start:
         off += vkmems[i].size;
     }
 
-    exec = ff_vk_exec_get(&ctx->exec_pool);
+    exec = ff_vk_exec_get(&ctx->s, &ctx->exec_pool);
 
     ff_vk_exec_start(&ctx->s, exec);
 
@@ -429,13 +429,6 @@ static const AVClass lcevc_encode_class = {
     .option     = NULL,
     .version    = LIBAVUTIL_VERSION_INT,
 };
-
-#if USE_VULKAN
-const AVCodecHWConfigInternal *const ff_vulkan_encode_hw_configs[] = {
-    HW_CONFIG_ENCODER_FRAMES(VULKAN, VULKAN),
-    NULL,
-};
-#endif
 
 const FFCodec ff_lcevc_encoder = {
     .p.name         = "lcevc_h264",
