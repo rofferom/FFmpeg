@@ -121,7 +121,7 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         return err;
     }
 
-    color_format = ctx->s.frames->sw_format;
+    color_format = fmt_map[ctx->s.frames->sw_format];
 #endif
 
     lc_open_info = (EILOpenSettings) {
