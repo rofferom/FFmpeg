@@ -17,6 +17,12 @@
  */
 
 #define USE_VULKAN 0
+#define USE_D3D11 1
+
+#include <libavcodec/hwconfig.h>
+#include <libavutil/avassert.h>
+#include <libavutil/pixfmt.h>
+#include <libavutil/time.h>
 
 #include "avcodec.h"
 #include "encode.h"
@@ -28,6 +34,25 @@
 #include "vulkan_encode.h"
 #include "libavutil/vulkan.h"
 #include "libavutil/mem.h"
+#endif
+
+
+#if USE_D3D11
+#define COBJMACROS
+
+#include <guiddef.h>
+#include <initguid.h>
+#include <d3d11.h>
+#include <d3d11_4.h>
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <windows.h>
+
+
+#include <libavformat/avformat.h>
+#include <libavutil/crc.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #endif
 
 #include "lcevc_eil.h"
@@ -43,6 +68,14 @@ typedef struct LCEVCENCCtx {
     FFVkExecPool exec_pool;
 #endif
 } LCEVCENCCtx;
+
+#if USE_D3D11
+const AVCodecHWConfigInternal *const ff_d3d11_hw_configs[] = {
+    HW_CONFIG_ENCODER_FRAMES(D3D11, D3D11VA),
+    HW_CONFIG_ENCODER_DEVICE(NONE,  D3D11VA),
+    NULL,
+};
+#endif
 
 static av_cold int lcevc_encode_close(AVCodecContext *avctx)
 {
@@ -97,9 +130,10 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
     EILReturnCode ret;
     LCEVCENCCtx *ctx = avctx->priv_data;
 
-    EILColourFormat color_format = fmt_map[avctx->pix_fmt];
+    EILColourFormat color_format;
     EILOpenSettings lc_open_info;
     EILInitSettings lc_init_info;
+    EILMemoryType memory_type;
 
 #if USE_VULKAN
     int err = ff_vk_init(&ctx->s, avctx, NULL, avctx->hw_frames_ctx);
@@ -122,6 +156,13 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
     }
 
     color_format = fmt_map[ctx->s.frames->sw_format];
+    memory_type = EIL_MT_VulkanBuffer;
+#elif USE_D3D11
+    color_format = EIL_BGRA_32;
+    memory_type = EIL_MT_D3D11Texture;
+#else
+    color_format = fmt_map[avctx->pix_fmt];
+    memory_type = EIL_MT_Host;
 #endif
 
     lc_open_info = (EILOpenSettings) {
@@ -139,14 +180,14 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
 
     lc_init_info = (EILInitSettings) {
         .color_format = color_format,
-        .memory_type = USE_VULKAN ? EIL_MT_VulkanBuffer : EIL_MT_Host,
+        .memory_type = memory_type,
         .width = avctx->width,
         .height = avctx->height,
         .fps_num = avctx->framerate.num,
         .fps_denom = avctx->framerate.den,
         .bitrate = avctx->bit_rate / 1000,
         .gop_length = avctx->gop_size,
-        .properties_json = USE_VULKAN ?
+        .properties_json = USE_D3D11 ?
 #if 0
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
 #else
@@ -369,10 +410,106 @@ start:
 
     for (int i = 0; i < lp->num_planes; i++)
         ff_vk_free_buf(&ctx->s, &tmp_buf[i]);
+#elif USE_D3D11
+    HRESULT hr;
+
+    // Get HW context
+    av_assert0(frame->format == AV_PIX_FMT_D3D11);
+    AVHWFramesContext *hw_ctx = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    av_assert0(hw_ctx->device_ctx->type == AV_HWDEVICE_TYPE_D3D11VA);
+    av_assert0(hw_ctx->sw_format == AV_PIX_FMT_BGRA);
+    AVD3D11VADeviceContext *d3d11va_context = (AVD3D11VADeviceContext *)hw_ctx->device_ctx->hwctx;
+
+    ID3D11Device *device = d3d11va_context->device;
+    ID3D11DeviceContext *device_context = d3d11va_context->device_context;
+
+    // Allocate sharable texture
+    ID3D11Texture2D *tex;
+    D3D11_TEXTURE2D_DESC texDesc = {
+        .Width      = frame->width,
+        .Height     = frame->height,
+        .MipLevels  = 1,
+        .Format     = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .SampleDesc = { .Count = 1 },
+        .ArraySize  = 1,
+        .Usage      = D3D11_USAGE_DEFAULT,
+        //.BindFlags  = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags  = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    };
+
+    hr = ID3D11Device_CreateTexture2D(device, &texDesc, NULL, &tex);
+    av_assert0(SUCCEEDED(hr));
+
+    ID3D11Resource *tex_d3d11_ressource;
+    hr = ID3D11Texture2D_QueryInterface(tex, &IID_ID3D11Resource, (void **)&tex_d3d11_ressource);
+    av_assert0(SUCCEEDED(hr));
+
+    // Export texture
+    IDXGIResource1 *tex_dxgi_ressource;
+    hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&tex_dxgi_ressource);
+    av_assert0(SUCCEEDED(hr));
+
+    HANDLE handle;
+    hr = IDXGIResource1_CreateSharedHandle(tex_dxgi_ressource, NULL, GENERIC_ALL, NULL, &handle);
+    av_assert0(SUCCEEDED(hr));
+
+    IDXGIResource1_Release(tex_dxgi_ressource);
+
+    // Prepare source texture
+    ID3D11Texture2D *src_tex = (ID3D11Texture2D *)frame->data[0];
+    intptr_t src_tex_idx = (intptr_t)frame->data[1];
+
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(src_tex, &desc);
+
+    ID3D11Resource *src_tex_d3d11_ressource;
+    hr = ID3D11Texture2D_QueryInterface(src_tex, &IID_ID3D11Resource, (void **)&src_tex_d3d11_ressource);
+    av_assert0(SUCCEEDED(hr));
+
+    // Copy texture
+    /////////
+
+    IDXGIKeyedMutex *keyed_mutex;
+    hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIKeyedMutex, (void **)&keyed_mutex);
+    av_assert0(SUCCEEDED(hr));
+
+    hr = IDXGIKeyedMutex_AcquireSync(keyed_mutex, 0, INFINITE);
+    av_assert0(SUCCEEDED(hr));
+
+    ID3D11DeviceContext_CopySubresourceRegion(device_context,
+        tex_d3d11_ressource, 0,
+        0, 0, 0,
+        src_tex_d3d11_ressource, src_tex_idx,
+        NULL);
+
+    hr = IDXGIKeyedMutex_ReleaseSync(keyed_mutex, 1);
+    av_assert0(SUCCEEDED(hr));
+    IDXGIKeyedMutex_Release(keyed_mutex);
+
+    IDXGIResource1_Release(tex_d3d11_ressource);
+    IDXGIResource_Release(src_tex_d3d11_ressource);
+
+    EILD3D11TextureInfo d3d11planes[3];
+    memset(d3d11planes, 0, sizeof(d3d11planes));
+    d3d11planes[0].handle = (MemoryHandle) handle;
+    d3d11planes[0].format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d3d11planes[0].width = frame->width;
+    d3d11planes[0].height = frame->height;
+    d3d11planes[0].sync_type = EIL_ST_D3D11KeyedMutex;
+    d3d11planes[0].acquire_key = 1;
+    d3d11planes[0].release_key = 0;
+
+    lp_tmp = (EILPicture) {
+        .memory_type = EIL_MT_D3D11Texture,
+        .num_planes = av_pix_fmt_count_planes(avctx->sw_pix_fmt),
+        .plane = { &d3d11planes[0], &d3d11planes[1], &d3d11planes[2] },
+        .stride = { frame->width, 0, 0 },
+    };
+    lp = &lp_tmp;
 #else
     lp_tmp = (EILPicture) {
         .memory_type = EIL_MT_Host,
-        .num_planes = av_pix_fmt_count_planes(avctx->pix_fmt),
+        .num_planes = av_pix_fmt_count_planes(avctx->sw_pix_fmt),
         .plane = { frame->data[0],
                    frame->data[1],
                    frame->data[2], },
@@ -388,6 +525,8 @@ start:
 
     ret = EIL_Encode(ctx->lc, lp);
     av_frame_free(&frame);
+    ID3D11Texture2D_Release(tex);
+    CloseHandle(handle);
     if (ret != EIL_RC_Success) {
         av_log(avctx, AV_LOG_ERROR, "Unable to encode picture: %i\n", ret);
         av_frame_free(&frame);
@@ -441,7 +580,7 @@ const FFCodec ff_lcevc_encoder = {
     .flush          = NULL,
     .close          = &lcevc_encode_close,
     .p.priv_class   = &lcevc_encode_class,
-    .p.capabilities = (USE_VULKAN ? AV_CODEC_CAP_HARDWARE : 0) |
+    .p.capabilities = (USE_D3D11 ? AV_CODEC_CAP_HARDWARE : 0) |
                       AV_CODEC_CAP_DR1,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 #if USE_VULKAN
@@ -451,6 +590,13 @@ const FFCodec ff_lcevc_encoder = {
     },
     .hw_configs     = ff_vulkan_encode_hw_configs,
     .p.wrapper_name = "vulkan",
+#elif USE_D3D11
+    .p.pix_fmts = (const enum AVPixelFormat[]) {
+        AV_PIX_FMT_D3D11,
+        AV_PIX_FMT_NONE,
+    },
+    .hw_configs     = ff_d3d11_hw_configs,
+    .p.wrapper_name = "lcevc_d3d11va",
 #else
     .p.pix_fmts = (const enum AVPixelFormat[]) {
         AV_PIX_FMT_YUV420P,

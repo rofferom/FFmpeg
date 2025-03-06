@@ -7312,11 +7312,13 @@ EOF
 
 mediafoundation_extralibs="-lmfuuid -lole32 -lstrmiids"
 
+d3d11va_extralibs="-ldxgi -ld3d11 -ldxguid"
+
 if enabled uwp; then
     # In UWP mode, we can't use LoadLibrary+GetProcAddress to conditionally
     # try to load these APIs at runtime, like we do in regular desktop mode -
     # therefore, we need to link directly against these APIs.
-    d3d11va_extralibs="-ldxgi -ld3d11"
+    d3d11va_extralibs="-ldxgi -ld3d11 -ldxguid"
     d3d12va_extralibs="-ldxgi -ld3d12"
     vaapi_win32_extralibs="-ldxgi"
     mediafoundation_extralibs="-lmfplat $mediafoundation_extralibs"
