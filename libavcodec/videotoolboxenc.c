@@ -18,12 +18,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <MacTypes.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <CoreVideo/CoreVideo.h>
 #include <CoreMedia/CoreMedia.h>
 #include <TargetConditionals.h>
 #include <Availability.h>
 #include "avcodec.h"
+#include "libavcodec/packet.h"
+#include "libavutil/error.h"
+#include "libavutil/frame.h"
+#include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/avassert.h"
@@ -40,6 +46,7 @@
 #include "h264_sei.h"
 #include "hwconfig.h"
 #include <dlfcn.h>
+#include <sys/errno.h>
 
 #if !HAVE_KCMVIDEOCODECTYPE_HEVC
 enum { kCMVideoCodecType_HEVC = 'hvc1' };
@@ -250,6 +257,8 @@ typedef struct VTEncContext {
     CFStringRef color_primaries;
     CFStringRef transfer_function;
     getParameterSetAtIndex get_param_set_func;
+
+    AVFrame *frame;
 
     pthread_mutex_t lock;
     pthread_cond_t  cv_sample_sent;
@@ -746,6 +755,8 @@ static void vtenc_output_callback(
     VTEncContext   *vtctx = avctx->priv_data;
     BufNode *info = sourceFrameCtx;
 
+    av_log(avctx, AV_LOG_INFO, "vtenc_output_callback called\n");
+
     av_buffer_unref(&info->frame_buf);
     if (vtctx->async_error) {
         vtenc_free_buf_node(info);
@@ -775,6 +786,8 @@ static void vtenc_output_callback(
         }
     }
 
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+    av_log(avctx, AV_LOG_INFO, "Pushing frame to queue (%lld)\n", pts.value / avctx->time_base.num);
     vtenc_q_push(vtctx, info);
 }
 
@@ -1295,6 +1308,17 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
         }
     }
 
+    CFNumberRef frameDelay = CFNumberCreate(kCFAllocatorDefault,
+        kCFNumberSInt32Type,
+        &(int){ 0 });
+    if (!frameDelay) return AVERROR(ENOMEM);
+    status = VTSessionSetProperty(vtctx->session,
+        kVTCompressionPropertyKey_MaxFrameDelayCount,
+        frameDelay);
+    if (status) {
+        av_log(avctx, AV_LOG_WARNING, "kVTCompressionPropertyKey_MaxFrameDelayCount property is not supported on this device. Ignoring.\n");
+    }
+
     if ((vtctx->codec_id == AV_CODEC_ID_H264 || vtctx->codec_id == AV_CODEC_ID_HEVC)
             && max_rate > 0) {
         bytes_per_second_value = max_rate >> 3;
@@ -1771,6 +1795,10 @@ static av_cold int vtenc_init(AVCodecContext *avctx)
 
     pthread_mutex_init(&vtctx->lock, NULL);
     pthread_cond_init(&vtctx->cv_sample_sent, NULL);
+
+    vtctx->frame = av_frame_alloc();
+    if (!vtctx->frame)
+        return AVERROR(ENOMEM);
 
     // It can happen when user set avctx->profile directly.
     if (vtctx->profile == AV_PROFILE_UNKNOWN)
@@ -2634,6 +2662,8 @@ static int vtenc_send_frame(AVCodecContext *avctx,
 #endif
 
     time = CMTimeMake(frame->pts * avctx->time_base.num, avctx->time_base.den);
+    av_log(avctx, AV_LOG_INFO, "Sending frame to encoder (%lld)\n", frame->pts);
+    VTEncodeInfoFlags flags;
     status = VTCompressionSessionEncodeFrame(
         vtctx->session,
         cv_img,
@@ -2641,8 +2671,12 @@ static int vtenc_send_frame(AVCodecContext *avctx,
         kCMTimeInvalid,
         frame_dict,
         node,
-        NULL
+        &flags
     );
+    if (flags & kVTEncodeInfo_Asynchronous)
+        av_log(avctx, AV_LOG_INFO, "Frame encoding async (%lld)\n", frame->pts);
+    if (flags & kVTEncodeInfo_FrameDropped)
+        av_log(avctx, AV_LOG_INFO, "Frame dropped (%lld)\n", frame->pts);
 
     if (status) {
         av_log(avctx, AV_LOG_ERROR, "Error: cannot encode frame: %d\n", status);
@@ -2722,8 +2756,63 @@ static av_cold int vtenc_frame(
     return 0;
 
 end_nopkt:
+av_log(avctx, AV_LOG_INFO, "End no pkt\n");
     av_packet_unref(pkt);
     return status;
+}
+
+static int ff_vtenc_receive_packet(AVCodecContext *avctx, AVPacket *packet)
+{
+    int ret;
+    OSStatus status;
+    CMSampleBufferRef sampleBuffer = NULL;
+    ExtraSEI sei = {0};
+    VTEncContext *vtctx = avctx->priv_data;
+    AVFrame *frame = vtctx->frame;
+
+    if (!vtctx->session)
+        return AVERROR(EINVAL);
+
+    ret = ff_encode_get_frame(avctx, frame);
+    if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN))
+        return ret;
+
+    if (frame && frame->buf[0]) {
+        ret = vtenc_send_frame(avctx, vtctx, frame);
+        if (ret < 0 && ret != AVERROR(EAGAIN))
+            return ret;
+        else if (ret == 0) {
+            if (vtctx->frame_ct_in == 0)
+                vtctx->first_pts = frame->pts;
+            else if (vtctx->frame_ct_in == vtctx->has_b_frames)
+                vtctx->dts_delta = frame->pts - vtctx->first_pts;
+
+            vtctx->frame_ct_in++;
+            av_frame_unref(frame);
+        }
+    }
+
+    if (avctx->internal->draining) {
+        status = VTCompressionSessionCompleteFrames(vtctx->session, kCMTimeIndefinite);
+        if (status) {
+            av_log(avctx, AV_LOG_ERROR, "Error flushing frames: %d\n", status);
+            return AVERROR_EXTERNAL;
+        }
+    }
+
+    status = vtenc_q_pop(vtctx, false, &sampleBuffer, &sei);
+    if (status)
+        return AVERROR_EXTERNAL;
+    else if (!sampleBuffer)
+        return (avctx->internal->draining) ? AVERROR_EOF : AVERROR(EAGAIN);
+
+    status = vtenc_cm_to_avpacket(avctx, sampleBuffer, packet, sei.data ? &sei : NULL);
+    av_free(sei.data);
+    CFRelease(sampleBuffer);
+    if (status < 0)
+        return status;
+
+    return 0;
 }
 
 static int vtenc_populate_extradata(AVCodecContext   *avctx,
@@ -2832,6 +2921,8 @@ pe_cleanup:
 static av_cold int vtenc_close(AVCodecContext *avctx)
 {
     VTEncContext *vtctx = avctx->priv_data;
+
+    av_frame_free(&vtctx->frame);
 
     if(!vtctx->session) {
         pthread_cond_destroy(&vtctx->cv_sample_sent);
@@ -2988,7 +3079,8 @@ const FFCodec ff_h264_videotoolbox_encoder = {
     CODEC_PIXFMTS_ARRAY(avc_pix_fmts),
     .defaults         = vt_defaults,
     .init             = vtenc_init,
-    FF_CODEC_ENCODE_CB(vtenc_frame),
+    //FF_CODEC_ENCODE_CB(vtenc_frame),
+    FF_CODEC_RECEIVE_PACKET_CB(ff_vtenc_receive_packet),
     .close            = vtenc_close,
     .p.priv_class     = &h264_videotoolbox_class,
     .caps_internal    = FF_CODEC_CAP_INIT_CLEANUP,
