@@ -48,6 +48,8 @@
 #include <dlfcn.h>
 #include <sys/errno.h>
 
+#include <os/signpost.h>
+
 #if !HAVE_KCMVIDEOCODECTYPE_HEVC
 enum { kCMVideoCodecType_HEVC = 'hvc1' };
 #endif
@@ -245,6 +247,7 @@ typedef struct BufNode {
     CMSampleBufferRef cm_buffer;
     ExtraSEI sei;
     AVBufferRef *frame_buf;
+    os_signpost_id_t signpost_id;
     struct BufNode* next;
 } BufNode;
 
@@ -257,6 +260,8 @@ typedef struct VTEncContext {
     CFStringRef color_primaries;
     CFStringRef transfer_function;
     getParameterSetAtIndex get_param_set_func;
+
+    os_log_t os_log;
 
     AVFrame *frame;
 
@@ -755,7 +760,11 @@ static void vtenc_output_callback(
     VTEncContext   *vtctx = avctx->priv_data;
     BufNode *info = sourceFrameCtx;
 
-    av_log(avctx, AV_LOG_INFO, "vtenc_output_callback called\n");
+    //av_log(avctx, AV_LOG_INFO, "vtenc_output_callback called\n");
+    //os_signpost_interval_begin(vtctx->os_log, node->signpost_id, "Frame encoding", "PTS %lld", frame->pts);
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+    if (__builtin_available(macOS 10.14, *))
+        os_signpost_interval_end(vtctx->os_log, info->signpost_id, "Frame encoding", "PTS %lld", pts.value / avctx->time_base.num);
 
     av_buffer_unref(&info->frame_buf);
     if (vtctx->async_error) {
@@ -786,8 +795,7 @@ static void vtenc_output_callback(
         }
     }
 
-    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
-    av_log(avctx, AV_LOG_INFO, "Pushing frame to queue (%lld)\n", pts.value / avctx->time_base.num);
+    //av_log(avctx, AV_LOG_INFO, "Pushing frame to queue (%lld)\n", pts.value / avctx->time_base.num);
     vtenc_q_push(vtctx, info);
 }
 
@@ -1207,6 +1215,8 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
     int64_t      bytes_per_second_value = 0;
     int64_t      one_second_value = 0;
     void         *nums[2];
+
+    vtctx->os_log = os_log_create("org.ffmpeg.perf", "videotoolboxenc");
 
     int status = VTCompressionSessionCreate(kCFAllocatorDefault,
                                             avctx->width,
@@ -2643,6 +2653,10 @@ static int vtenc_send_frame(AVCodecContext *avctx,
     if (!node)
         return AVERROR(ENOMEM);
 
+    if (__builtin_available(macOS 10.14, *)) {
+        node->signpost_id = os_signpost_id_generate(vtctx->os_log);
+    }
+
     status = create_cv_pixel_buffer(avctx, frame, &cv_img, node);
     if (status)
         goto out;
@@ -2662,7 +2676,9 @@ static int vtenc_send_frame(AVCodecContext *avctx,
 #endif
 
     time = CMTimeMake(frame->pts * avctx->time_base.num, avctx->time_base.den);
-    av_log(avctx, AV_LOG_INFO, "Sending frame to encoder (%lld)\n", frame->pts);
+    //av_log(avctx, AV_LOG_INFO, "Sending frame to encoder (%lld)\n", frame->pts);
+    if (__builtin_available(macOS 10.14, *))
+        os_signpost_interval_begin(vtctx->os_log, node->signpost_id, "Frame encoding", "PTS %lld", frame->pts);
     VTEncodeInfoFlags flags;
     status = VTCompressionSessionEncodeFrame(
         vtctx->session,
@@ -2673,8 +2689,8 @@ static int vtenc_send_frame(AVCodecContext *avctx,
         node,
         &flags
     );
-    if (flags & kVTEncodeInfo_Asynchronous)
-        av_log(avctx, AV_LOG_INFO, "Frame encoding async (%lld)\n", frame->pts);
+    //if (flags & kVTEncodeInfo_Asynchronous)
+    //    av_log(avctx, AV_LOG_INFO, "Frame encoding async (%lld)\n", frame->pts);
     if (flags & kVTEncodeInfo_FrameDropped)
         av_log(avctx, AV_LOG_INFO, "Frame dropped (%lld)\n", frame->pts);
 
