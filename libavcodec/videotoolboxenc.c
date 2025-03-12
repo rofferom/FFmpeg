@@ -1270,6 +1270,23 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
         return AVERROR_EXTERNAL;
     }
 
+    {
+        CFNumberRef framerate_num = CFNumberCreate(kCFAllocatorDefault,
+            kCFNumberFloatType,
+            &(float){ 60 });
+        if (!framerate_num)
+            return AVERROR(ENOMEM);
+        
+        status = VTSessionSetProperty(vtctx->session,
+            kVTCompressionPropertyKey_ExpectedFrameRate,
+            framerate_num);
+        if (status == kVTPropertyNotSupportedErr) {
+            av_log(avctx, AV_LOG_ERROR, "Error: kVTCompressionPropertyKey_ExpectedFrameRate is not supported by the encoder.\n");
+            return AVERROR_EXTERNAL;
+        }
+        CFRelease(framerate_num);
+    }
+
     if (avctx->flags & AV_CODEC_FLAG_QSCALE) {
         quality = quality >= 100 ? 1.0 : quality / 100;
         quality_num = CFNumberCreate(kCFAllocatorDefault,
