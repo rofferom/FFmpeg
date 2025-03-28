@@ -22,6 +22,7 @@
 #include <libavcodec/hwconfig.h>
 #include <libavutil/avassert.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/thread.h>
 #include <libavutil/time.h>
 
 #include "avcodec.h"
@@ -67,6 +68,10 @@ typedef struct LCEVCENCCtx {
     AVVulkanDeviceQueueFamily *qf;
     FFVkExecPool exec_pool;
 #endif
+
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    EILOutput *encoded_frame;
 } LCEVCENCCtx;
 
 #if USE_D3D11
@@ -88,6 +93,9 @@ static av_cold int lcevc_encode_close(AVCodecContext *avctx)
     ff_vk_exec_pool_free(&ctx->s, &ctx->exec_pool);
     ff_vk_uninit(&ctx->s);
 #endif
+
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
 
     return 0;
 }
@@ -123,6 +131,17 @@ static void log_cb(void *opaque, int32_t level, const char *msg)
         [EIL_LL_Debug] = AV_LOG_DEBUG,
     };
     av_log(opaque, averrc[level], "%s", msg);
+}
+
+static void on_encoded_callback(void* userdata, EILOutput* output)
+{
+    AVCodecContext *avctx = userdata;
+    LCEVCENCCtx *ctx = avctx->priv_data;
+
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->encoded_frame = output;
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
 }
 
 static av_cold int lcevc_encode_init(AVCodecContext *avctx)
@@ -210,6 +229,16 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
         return AVERROR_EXTERNAL;
     }
 
+    ret = EIL_SetOnEncodedCallback(ctx->lc, avctx, on_encoded_callback);
+    if (ret != EIL_RC_Success) {
+        av_log(avctx, AV_LOG_ERROR, "Unable to set encoded callback: %i\n", ret);
+        lcevc_encode_close(avctx);
+        return AVERROR_EXTERNAL;
+    }
+
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+
     return 0;
 }
 
@@ -269,13 +298,6 @@ static int lcevc_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     EILPicture *lp = NULL;
 
-    /* Check if we have something to output first before pulling frames */
-    lo = NULL;
-    ret = EIL_GetOutput(ctx->lc, &lo);
-    if (ret == EIL_RC_Success)
-        goto output;
-
-start:
     frame = av_frame_alloc();
     if (!frame)
         return AVERROR(ENOMEM);
@@ -539,19 +561,12 @@ start:
         return AVERROR_EXTERNAL;
     }
 
-    lo = NULL;
-    ret = EIL_GetOutput(ctx->lc, &lo);
+    pthread_mutex_lock(&ctx->mutex);
+    pthread_cond_wait(&ctx->cond, &ctx->mutex);
+    lo = ctx->encoded_frame;
+    pthread_mutex_unlock(&ctx->mutex);
 
-output:
-    /* No output */
-    if (ret == EIL_RC_Finished)
-        goto start;
-
-    if (ret != EIL_RC_Success) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to get output data: %i\n", ret);
-        return AVERROR_EXTERNAL;
-    }
-
+    // Get frame
     out_ref = av_buffer_create((uint8_t *)lo, sizeof(lo),
                                lo_free_cb, ctx->lc,
                                AV_BUFFER_FLAG_READONLY);
