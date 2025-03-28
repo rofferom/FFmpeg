@@ -191,7 +191,13 @@ static av_cold int lcevc_encode_init(AVCodecContext *avctx)
 #if 0
                            "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\"}" :
 #else
-                           "{\"lcevc_encoder_type\": \"gpu\", \"gpu_device\": \"NVIDIA\", \"log_groups\": \"gpu\"}" :
+                           "{\"lcevc_encoder_type\": \"gpu\","
+                           "\"gpu_device\": \"NVIDIA\","
+                           "\"lcevc_tune\": \"low_latency\","
+                           "\"lcevc_preset\": 3,"
+                           "\"preset\": 1,"
+                           "\"tuning_info\": \"ultra-low-latency\","
+                           "\"log_groups\": \"gpu\"}" :
 #endif
                            NULL,
         .external_input = 1,
