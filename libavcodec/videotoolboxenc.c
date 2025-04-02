@@ -773,7 +773,8 @@ static void vtenc_output_callback(
     //os_signpost_interval_begin(vtctx->os_log, node->signpost_id, "Frame encoding", "PTS %lld", frame->pts);
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
     if (__builtin_available(macOS 10.14, *))
-        os_signpost_interval_end(vtctx->os_log, info->signpost_id, "Frame encoding", "PTS %lld", pts.value / avctx->time_base.num);
+        os_log(vtctx->os_log, "Frame trace [PTS %lld]: Encode done", pts.value);
+    //os_signpost_interval_end(vtctx->os_log, info->signpost_id, "Frame encoding", "PTS %lld", pts.value / avctx->time_base.num);
 
     av_buffer_unref(&info->frame_buf);
     if (vtctx->async_error) {
@@ -1225,7 +1226,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
     int64_t      one_second_value = 0;
     void         *nums[2];
 
-    vtctx->os_log = os_log_create("org.ffmpeg.perf", "videotoolboxenc");
+    vtctx->os_log = os_log_create("org.ffmpeg.perf", "vte");
 
     int status = VTCompressionSessionCreate(kCFAllocatorDefault,
                                             avctx->width,
@@ -2679,10 +2680,6 @@ static int vtenc_send_frame(AVCodecContext *avctx,
     if (!node)
         return AVERROR(ENOMEM);
 
-    if (__builtin_available(macOS 10.14, *)) {
-        node->signpost_id = os_signpost_id_generate(vtctx->os_log);
-    }
-
     status = create_cv_pixel_buffer(avctx, frame, &cv_img, node);
     if (status)
         goto out;
@@ -2704,7 +2701,8 @@ static int vtenc_send_frame(AVCodecContext *avctx,
     time = CMTimeMake(frame->pts * avctx->time_base.num, avctx->time_base.den);
     //av_log(avctx, AV_LOG_INFO, "Sending frame to encoder (%lld)\n", frame->pts);
     if (__builtin_available(macOS 10.14, *))
-        os_signpost_interval_begin(vtctx->os_log, node->signpost_id, "Frame encoding", "PTS %lld", frame->pts);
+        os_log(vtctx->os_log, "Frame trace [PTS %lld]: Encode start", frame->pts);
+    //os_signpost_interval_begin(vtctx->os_log, node->signpost_id, "Frame encoding", "PTS %lld", frame->pts);
     VTEncodeInfoFlags flags;
     status = VTCompressionSessionEncodeFrame(
         vtctx->session,
@@ -2717,8 +2715,12 @@ static int vtenc_send_frame(AVCodecContext *avctx,
     );
     //if (flags & kVTEncodeInfo_Asynchronous)
     //    av_log(avctx, AV_LOG_INFO, "Frame encoding async (%lld)\n", frame->pts);
-    if (flags & kVTEncodeInfo_FrameDropped)
+    if (flags & kVTEncodeInfo_FrameDropped) {
         av_log(avctx, AV_LOG_INFO, "Frame dropped (%lld)\n", frame->pts);
+        if (__builtin_available(macOS 10.14, *))
+            os_log(vtctx->os_log, "Frame trace [PTS %lld]: Encode dropped frame", frame->pts);
+            //os_signpost_interval_end(vtctx->os_log, node->signpost_id, "Frame trace", "Dropped frame [PTS %lld]", frame->pts);
+    }
 
     if (status) {
         av_log(avctx, AV_LOG_ERROR, "Error: cannot encode frame: %d\n", status);
