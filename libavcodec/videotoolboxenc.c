@@ -442,6 +442,15 @@ static int vtenc_q_pop(VTEncContext *vtctx, bool wait, CMSampleBufferRef *buf, E
         return 0;
     }
 
+    if (vtctx->frame_ct_in && (vtctx->frame_ct_in - 1 == vtctx->frame_ct_out)) {
+        // If we have no pending frames, switch to blocking mode
+        av_log(vtctx, AV_LOG_INFO, "Waiting blocking for packet\n");
+        wait = true;
+    } else {
+        av_log(vtctx, AV_LOG_INFO, "Count in %lld out %lld\n",
+            vtctx->frame_ct_in, vtctx->frame_ct_out);
+    }
+
     while (!vtctx->q_head && !vtctx->async_error && wait && !vtctx->flushing) {
         pthread_cond_wait(&vtctx->cv_sample_sent, &vtctx->lock);
     }
@@ -1276,7 +1285,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
             &(float){ 60 });
         if (!framerate_num)
             return AVERROR(ENOMEM);
-        
+
         status = VTSessionSetProperty(vtctx->session,
             kVTCompressionPropertyKey_ExpectedFrameRate,
             framerate_num);
