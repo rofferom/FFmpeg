@@ -1345,6 +1345,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
         }
     }
 
+    /*
     CFNumberRef frameDelay = CFNumberCreate(kCFAllocatorDefault,
         kCFNumberSInt32Type,
         &(int){ 0 });
@@ -1355,6 +1356,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
     if (status) {
         av_log(avctx, AV_LOG_WARNING, "kVTCompressionPropertyKey_MaxFrameDelayCount property is not supported on this device. Ignoring.\n");
     }
+    */
 
     if ((vtctx->codec_id == AV_CODEC_ID_H264 || vtctx->codec_id == AV_CODEC_ID_HEVC)
             && max_rate > 0) {
